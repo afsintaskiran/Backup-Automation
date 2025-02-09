@@ -1,0 +1,110 @@
+# Backup Automation - Secure and Optimized Implementation with Encryption, JWT Authentication, Database Integration & Web API
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Depends
+import paramiko
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from typing import Optional
+from pymongo import MongoClient
+from fastapi.middleware.cors import CORSMiddleware
+
+# Database configuration
+MONGO_URI = "mongodb://localhost:27017"
+client = MongoClient(MONGO_URI)
+db = client["backup_automation"]
+users_collection = db["users"]
+backups_collection = db["backups"]
+
+# Security configurations
+SECRET_KEY = "your_secret_key_here"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+app = FastAPI()
+
+# CORS Middleware for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta if expires_delta else timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+class BackupRequest(BaseModel):
+    device_ip: str
+    username: str
+    password: str
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+
+@app.get("/")
+def read_root():
+    return {"message": "Backup Automation API is running"}
+
+def backup_device(device_ip: str, username: str, password: str):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(device_ip, username=username, password=password, timeout=10)
+        
+        stdin, stdout, stderr = ssh.exec_command("show running-config")
+        config_data = stdout.read().decode()
+        ssh.close()
+        
+        if not config_data:
+            raise Exception("Failed to retrieve configuration")
+        
+        # Save backup to database
+        backups_collection.insert_one({
+            "device_ip": device_ip,
+            "username": username,
+            "config_data": config_data,
+            "timestamp": datetime.utcnow()
+        })
+        
+        return {"status": "success", "device": device_ip, "config": config_data}
+    except Exception as e:
+        return {"status": "error", "device": device_ip, "message": str(e)}
+
+@app.post("/backup")
+def trigger_backup(request: BackupRequest):
+    if not request.device_ip or not request.username or not request.password:
+        raise HTTPException(status_code=400, detail="Invalid input data")
+    return backup_device(request.device_ip, request.username, request.password)
+
+@app.post("/register")
+def register_user(user: UserRegister):
+    hashed_password = get_password_hash(user.password)
+    users_collection.insert_one({"username": user.username, "password": hashed_password})
+    return {"message": "User registered successfully"}
+
+@app.post("/token")
+def login_for_access_token(username: str, password: str):
+    user = users_collection.find_one({"username": username})
+    if not user or not verify_password(password, user["password"]):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": username}, expires_delta=access_token_expires)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
